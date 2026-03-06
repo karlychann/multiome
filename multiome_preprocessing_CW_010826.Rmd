@@ -1,0 +1,1697 @@
+#### set up part 1
+```{r}
+# this needs to be run first for the correct numpy version to be identified
+library(reticulate)
+#use_virtualenv("/n/home11/karlychan/.virtualenvs/r-reticulate", required = TRUE)
+
+setwd("~/Scripts/multiome")
+renv::restore()
+```
+#### set up part 2
+```{r setup, include=FALSE}
+library(Seurat)
+library(Signac)
+library(dplyr)
+library(ggplot2)
+library(patchwork)
+library(tidyverse)
+library(grDevices)
+library(stringr)
+library(SoupX)
+library(scDblFinder)
+library(hdf5r) 
+library(DropletUtils)
+library(GenomicRanges)
+library(IRanges)
+library(stringr)
+library(harmony)
+library(future)
+library(SingleR)
+library(presto)
+library(JASPAR2020)
+library(TFBSTools)
+library(Rsamtools)
+knitr::opts_chunk$set(echo = TRUE)
+
+# defining global variables
+output_dir = "/n/netscratch/whited_lab/Lab/sycwu/multiome_plots/"
+input_dir = "/n/whited_lab/Users/sycwu/multiome_analysis"
+  
+mito_genes <- c("ND1","ND2","ND3","ND4","ND4L","ND5","ND6","COX1","COX2","COX3","CYTB","ATP6","ATP8")
+
+map <- c(
+  "NC-090921.1" = "1p",
+  "NC-090922.1" = "1q",
+  "NC-090923.1" = "2p",
+  "NC-090924.1" = "2q",
+  "NC-090925.1" = "3p",
+  "NC-090926.1" = "3q",
+  "NC-090927.1" = "4p",
+  "NC-090928.1" = "4q",
+  "NC-090930.1" = "5p",
+  "NC-090933.1" = "5q",
+  "NC-090935.1" = "6p",
+  "NC-090937.1" = "6q",
+  "NC-090939.1" = "7p",
+  "NC-090941.1" = "7q",
+  "NC-090929.1" = "8",
+  "NC-090931.1" = "9",
+  "NC-090932.1" = "10",
+  "NC-090934.1" = "11",
+  "NC-090936.1" = "12",
+  "NC-090938.1" = "13",
+  "NC-090940.1" = "14",
+  "NC-005797.1" = "MT"
+)
+```
+
+### PREPROCESSING
+#### function for rename peaks to chr-start-end format
+```{r}
+# chromosome map from NCBI ***now addresses mito + lone scaffolds/contigs!
+rename_peaks <- function(peak_names, map) {
+  NW_count <- 0     # number of discarded NW peaks
+  
+  cleaned <- sapply(peak_names, function(x) {
+    # Replace _ with - for NCBI format
+    base <- gsub("_", "-", x)
+    #message(base)
+    
+    # Adjust coordinates by origin of contig 
+    # TODO: check for off by 1 errors?
+    contig_origin_group <- str_match(base, "\\^o[0-9]+")
+    contig_origin <- substring(contig_origin_group, 3)
+
+    # Remove anything after ^
+    chr_base <- sub("\\^.*", "", base)
+    #message(chr_base)
+    
+    # Special case for the MT scaffold
+    if (substring(base, 1, 11) == c("NC-005797.1")) {
+      chr_base <- c("NC-005797.1")
+    }
+
+    # Check if chromosome extracted and mapped correctly
+    if (!chr_base %in% names(map)) {
+      if (substring(chr_base, 2, 2) == c("W")) {
+        # TODO: I suspect these are unplaced scaffolds?
+        # TODO: counter does not work right now
+        NW_count <- NW_count + 1
+        # strip NW-
+        chr <- substring(chr_base, 4)
+        # strip everything after :
+        chr <- sub(":.*", "", chr)
+        
+        # Sanity check that all NW contigs should end with .1 because we strip everything after the .
+        if (str_sub(chr, -1, -1) != c("1")) {
+          message("WARNING: NW contig not ending in .1")
+        } else {
+          # strip the ".1"
+          chr <- sub("\\.1", "", chr)
+        }
+      } else {
+        # NOT in mapping, NOT "NW"
+        message(paste("WARNING! Could not map:", x))
+      }
+    } else {
+      # Map the name of the chromosome from contig name to chromosome number
+      chr <- map[[chr_base]]
+    }
+    
+    
+    # Extract coordinates - looking for last two numbers separated by -
+    coords <- str_extract_all(x, "\\d+")[[1]]
+    if (length(coords) < 2) {
+      return(NA)
+    }
+    coords <- tail(coords, 2)
+    
+    # Ensure coordinates are numeric
+    if (any(is.na(as.numeric(coords)))) {
+      return(NA)
+    }
+    
+    # Adjust coordinates from contig origin
+    if (!is.na(contig_origin)) {
+      adj_start <- as.numeric(coords[1]) + as.numeric(contig_origin)
+      adj_end <- as.numeric(coords[2]) + as.numeric(contig_origin)
+    } else {
+      adj_start <- coords[1]
+      adj_end <- coords[2]
+    }
+    
+    # Format as chr-start-end
+    paste(chr, adj_start, adj_end, sep = "-")
+  })
+  #message(paste("NW_count: ", NW_count))
+  return(cleaned)
+}
+```
+
+#### functions for QC plotting (kneeplot)
+```{r}
+kneeplots <- function(seurat_obj, step, output = output_dir) {
+  # ---------- RNA ---------- 
+  counts <- GetAssayData(seurat_obj, slot = "counts", assay = "RNA")
+  br <- DropletUtils::barcodeRanks(counts)
+  df <- data.frame(rank = br$rank, total = br$total)
+
+  knee_plot1 <- ggplot(df, aes(x = rank, y = total)) +
+    geom_point(size = 0.5) +
+    scale_x_log10() + scale_y_log10() +
+    labs(title = paste("RNA Knee Plot -", step), x = "Barcode Rank", y = "Total Counts") +
+    theme_minimal()
+
+  # ---------- ATAC ---------- 
+  counts_atac <- GetAssayData(seurat_obj, slot = "counts", assay = "ATAC")
+  br <- DropletUtils::barcodeRanks(counts_atac)
+  df <- data.frame(rank = br$rank, total = br$total)
+
+  knee_plot2 <- ggplot(df, aes(x = rank, y = total)) +
+    geom_point(size = 0.5) +
+    scale_x_log10() + scale_y_log10() +
+    labs(title = paste("ATAC Knee Plot -", step), x = "Barcode Rank", y = "Total Counts") +
+    theme_minimal()
+
+  # ---------- COMBINED ---------- 
+  kp_combined <- knee_plot1 / knee_plot2
+  ggsave(paste0(output_dir, step, "_kneeplots_.png"), plot = kp_combined)
+}
+
+plot_nCountvsFeature <- function(seurat_obj, output = output_dir) {
+  meta <- seurat_obj@meta.data
+  
+  # Color by log10geneperUMI
+  plotcountbyfeature <- ggplot(meta, aes(x = nCount_RNA, y = nFeature_RNA)) +
+    geom_point(alpha = 0.6, size = 1.5) +
+    facet_wrap(~ sample_id, scales = "free") +
+    theme_bw() +
+    labs(
+      x = "nCount_RNA",
+      y = "nFeature_RNA",
+      title = "QC: nFeature_RNA vs nCount_RNA by Sample"
+    )
+  
+  ggsave(filename = file.path(output, paste0(seurat_obj$sample_id[1], "_nCountvsFeature.png")), plot = plotcountbyfeature)
+}
+```
+
+#### function for preprocessing each sample: https://informatics.fas.harvard.edu/workshops/short-trainings/scRNA-intro/SinglecellRNAseq_part2/
+```{r}
+process_sample <- function(data_dir = input_dir, prefix) {
+  # Add this to see warnings immediately
+  options(warn = 1) 
+  cat("--- Starting processing for prefix:", prefix, "---\n")
+  
+  # 1. Reading data
+  path_prefix <- file.path(data_dir, paste0("P525_DPayz_", prefix), "outs")
+  filtered_file <- file.path(path_prefix, "filtered_feature_bc_matrix")
+  filtered <- Seurat::Read10X(filtered_file)
+  raw_file <- file.path(path_prefix, "raw_feature_bc_matrix")
+  raw <- Seurat::Read10X(raw_file)
+  frag_file <- file.path(path_prefix, "atac_fragments.tsv.gz")
+  cat("1. Data loaded. Filtered matrix RNA dimensions:", dim(filtered$`Gene Expression`), "\n")
+  
+  # 2. Map ATAC peaks from chunked genome format to NCBI absolute format
+  atac_counts <- filtered$Peaks
+  peak_names <- rownames(atac_counts)
+  renamed_peaks <- rename_peaks(peak_names, map)
+  problematic_peaks <- grep("\\.0", peak_names, value = TRUE)
+  valid_peaks <- !is.na(renamed_peaks)
+  atac_counts <- atac_counts[valid_peaks, ]
+  rownames(atac_counts) <- renamed_peaks[valid_peaks]
+  
+  # 3. Create initial Seurat object: RNA and ATAC assays
+  seurat <- CreateSeuratObject(counts = filtered$`Gene Expression`)
+  chrom_assay <- CreateChromatinAssay(
+    counts = atac_counts,
+    sep = c("-", "-"),
+    fragments = frag_file,
+    min.cells = 10
+  )
+  seurat[["ATAC"]] <- chrom_assay
+  
+  # 4A. Initial Seurat object processing - note that only RNA-seq values are normalized!
+  DefaultAssay(seurat) <- "RNA"
+  seurat[["percent.mt"]] <- PercentageFeatureSet(seurat, features = mito_genes)
+  seurat <- SCTransform(seurat, vars.to.regress = "percent.mt", verbose = FALSE)
+  seurat <- RunPCA(seurat, verbose = FALSE)
+  seurat <- RunUMAP(seurat, dims = 1:30)
+  seurat <- FindNeighbors(seurat, dims = 1:30)
+  seurat <- FindClusters(seurat)
+  DefaultAssay(seurat) <- "RNA"
+  cat("4A. Initial Seurat object processed. Dimensions:", dim(seurat), "\n")
+  
+  # 4B. Generate knee plots and violin plots (initial)
+  current_step = paste0(prefix, "_initial")
+  kneeplots(seurat, step = current_step)
+  # Prevent violin plot from showing clusters
+  seurat$all_cells <- "All"
+  Idents(seurat) <- "all_cells"
+  vln1 <- VlnPlot(seurat, features = c("nCount_ATAC", "nCount_RNA", "percent.mt"), ncol = 3, log = TRUE, pt.size = 0) + NoLegend()
+  vln2 <- VlnPlot(seurat, features = c("nFeature_ATAC", "nFeature_RNA"), ncol = 2, log = TRUE, pt.size = 0) + NoLegend()
+  vln_combined <- vln1 / vln2
+  ggsave(paste0(output_dir, current_step, "_vlnplot_.png"), plot = vln_combined)
+  Idents(seurat) <- "seurat_clusters"
+  
+  # 5A. SoupX correction
+  soup_channel <- SoupX::SoupChannel(tod = raw$"Gene Expression", toc = filtered$"Gene Expression", is10X = TRUE)
+  soup_channel <- SoupX::setClusters(soup_channel, clusters = as.factor(Idents(seurat)))
+  soup_channel <- SoupX::setDR(soup_channel, DR=Seurat::Embeddings(seurat, "umap"))
+  soup_channel <- SoupX::autoEstCont(soup_channel)
+  corrected_counts <- SoupX::adjustCounts(soup_channel, roundToInt=TRUE)
+  cat("5A. SoupX correction complete. Corrected counts dimensions:", dim(corrected_counts), "\n")
+  rm(raw, filtered, soup_channel, seurat); gc(verbose=FALSE)
+  
+  # 5B. Create SoupX object
+  seurat_soupx <- CreateSeuratObject(counts = corrected_counts)
+  seurat_soupx[["ATAC"]] <- chrom_assay
+  rm(corrected_counts); gc(verbose=FALSE)
+  
+  # 5C. Generate knee plots and violin plots (SoupX)
+  DefaultAssay(seurat_soupx) <- "RNA"
+  seurat_soupx[["percent.mt"]] <- PercentageFeatureSet(seurat_soupx, features = mito_genes)
+  current_step = paste0(prefix, "_SoupX")
+  kneeplots(seurat_soupx, step = current_step)
+  # Prevent violin plot from showing clusters
+  seurat_soupx$all_cells <- "All"
+  Idents(seurat_soupx) <- "all_cells"
+  vln1 <- VlnPlot(seurat_soupx, features = c("nCount_ATAC", "nCount_RNA", "percent.mt"), ncol = 3, log = TRUE, pt.size = 0) + NoLegend()
+  vln2 <- VlnPlot(seurat_soupx, features = c("nFeature_ATAC", "nFeature_RNA"), ncol = 2, log = TRUE, pt.size = 0) + NoLegend()
+  vln_combined <- vln1 / vln2
+  ggsave(paste0(output_dir, current_step, "_vlnplot_.png"), plot = vln_combined)
+  Idents(seurat_soupx) <- "seurat_clusters"
+
+  
+  # 6A. Doublet Finder
+  sce <- as.SingleCellExperiment(seurat_soupx)
+  cat("6A. Running scDblFinder...\n")
+  sce <- scDblFinder(sce)
+  cat("6A. scDblFinder finished. Assigning classes.\n")
+  seurat_soupx$scDblFinder.class <- colData(sce)$scDblFinder.class
+
+  # 6B. Check how many singlets vs doublets were found
+  cat("--- Doublet Finder Results ---\n")
+  print(table(seurat_soupx$scDblFinder.class))
+  cat("----------------------------\n")
+  seurat_singlets <- subset(seurat_soupx, subset = scDblFinder.class == "singlet")
+  cat("6B. Subset to singlets. Dimensions:", dim(seurat_singlets), "\n")
+  rm(seurat_soupx, sce); gc(verbose=FALSE)
+
+  # 6C. Generate knee plots and violin plots (SoupX -> Doublet Finder)
+  DefaultAssay(seurat_singlets) <- "RNA"
+  seurat_singlets[["percent.mt"]] <- PercentageFeatureSet(seurat_singlets, features = mito_genes)
+  current_step = paste0(prefix, "_SoupX_Singlets")
+  kneeplots(seurat_singlets, step = current_step)
+  # Prevent violin plot from showing clusters
+  seurat_singlets$all_cells <- "All"
+  Idents(seurat_singlets) <- "all_cells"
+  vln1 <- VlnPlot(seurat_singlets, features = c("nCount_ATAC", "nCount_RNA", "percent.mt"), ncol = 3, log = TRUE, pt.size = 0) + NoLegend()
+  vln2 <- VlnPlot(seurat_singlets, features = c("nFeature_ATAC", "nFeature_RNA"), ncol = 2, log = TRUE, pt.size = 0) + NoLegend()
+  vln_combined <- vln1 / vln2
+  ggsave(paste0(output_dir, current_step, "_vlnplot_.png"), plot = vln_combined)
+  Idents(seurat_singlets) <- "seurat_clusters"
+  
+  # 7A. Final QC Filtering
+  # Check how many cells will pass the filter BEFORE you subset
+  pass_filter <- 
+    seurat_singlets$nFeature_RNA > 200 & 
+    seurat_singlets$nCount_RNA > 500 & 
+    seurat_singlets$nCount_RNA < 25000 &
+    seurat_singlets$nCount_ATAC > 1000 & 
+    seurat_singlets$nCount_ATAC < 30000 & 
+    seurat_singlets$percent.mt < 20
+  cat("--- Final QC Filter ---\n")
+  cat("Cells passing filter:", sum(pass_filter), "out of", ncol(seurat_singlets), "\n")
+  cat("-----------------------\n")
+  seurat_singlets_posthoc <- subset(seurat_singlets, subset = 
+                                      nFeature_RNA > 200 & 
+                                      nCount_RNA > 500 & 
+                                      nCount_RNA < 25000 &
+                                      nCount_ATAC > 1000 & 
+                                      nCount_ATAC < 30000 & 
+                                      percent.mt < 20)
+  # keep track of sample
+  seurat_singlets_posthoc$sample_id <- prefix
+  cat("7A. Final object created. Dimensions:", dim(seurat_singlets_posthoc), "\n")
+  
+  # 7B. Generate knee plots and violin plots (SoupX -> Doublet Finder -> Filtering)
+  DefaultAssay(seurat_singlets_posthoc) <- "RNA"
+  seurat_singlets_posthoc[["percent.mt"]] <- PercentageFeatureSet(seurat_singlets_posthoc, features = mito_genes)
+  current_step = paste0(prefix, "_SoupX_Singlets_posthoc")
+  kneeplots(seurat_singlets_posthoc, step = current_step)
+  # Prevent violin plot from showing clusters
+  seurat_singlets_posthoc$all_cells <- "All"
+  Idents(seurat_singlets_posthoc) <- "all_cells"
+  vln1 <- VlnPlot(seurat_singlets_posthoc, features = c("nCount_ATAC", "nCount_RNA", "percent.mt"), ncol = 3, log = TRUE, pt.size = 0) + NoLegend()
+  vln2 <- VlnPlot(seurat_singlets_posthoc, features = c("nFeature_ATAC", "nFeature_RNA"), ncol = 2, log = TRUE, pt.size = 0) + NoLegend()
+  vln_combined <- vln1 / vln2
+  ggsave(paste0(output_dir, current_step, "_vlnplot_.png"), plot = vln_combined)
+  Idents(seurat_singlets_posthoc) <- "seurat_clusters"
+  
+  # 8. Return objects
+  # Check if the final object is NULL before returning
+  if (is.null(seurat_singlets_posthoc)) {
+    cat("!!! WARNING: Final object is NULL before returning.\n")
+  }
+  cat("--- Function finished. Returning object. ---\n")
+  return(seurat_singlets_posthoc)
+}
+```
+  
+#### preprocessing each sample
+```{r}
+samples <- c("BL1", "BL2", "CTL1", "CTL2", "INT1", "INT2")
+
+results <- list()
+for (i in samples) {results[[i]] <- process_sample(input_dir, i)}
+```
+
+#### saving each sample object into OUTPUT_DIR
+```{r}
+# Save each object!
+BL1 <- results[[1]]
+BL2 <- results[[2]]
+CTL1 <- results[[3]]
+CTL2 <- results[[4]]
+INT1 <- results[[5]]
+INT2 <- results[[6]]
+
+saveRDS(
+   object = BL1,
+   file = file.path(output_dir, "BL1_preprocessedformerge.Rds")
+)
+saveRDS(
+   object = BL2,
+   file = file.path(output_dir, "BL2_preprocessedformerge.Rds")
+)
+saveRDS(
+   object = CTL1,
+   file = file.path(output_dir, "CTL1_preprocessedformerge.Rds")
+)
+saveRDS(
+   object = CTL2,
+   file = file.path(output_dir, "CTL2_preprocessedformerge.Rds")
+)
+saveRDS(
+   object = INT1,
+   file = file.path(output_dir, "INT1_preprocessedformerge.Rds")
+)
+saveRDS(
+   object = INT2,
+   file = file.path(output_dir, "INT2_preprocessedformerge.Rds")
+)
+```
+#### merging RNA-seq
+```{r}
+rna_merged <- merge(
+  x = BL1,
+  y = c(BL2, CTL1, CTL2, INT1, INT2),
+  add.cell.ids = c("BL1","BL2","CTL1","CTL2","INT1","INT2"),
+  project = "merged_RNA_only"
+)
+DefaultAssay(rna_merged) <- "RNA"
+
+rna_merged[["percent.mt"]] <- PercentageFeatureSet(rna_merged, features = mito_genes)
+rna_merged <- SCTransform(rna_merged, vars.to.regress = "percent.mt", verbose = FALSE)
+rna_merged <- RunPCA(rna_merged, verbose = FALSE)
+
+# Workshop parameters
+#rna_merged <- FindNeighbors(rna_merged, dims = 1:30)
+#rna_merged <- FindClusters(rna_merged)
+#rna_merged <- RunUMAP(rna_merged, dims = 1:30)
+
+# updated 1/11/26: PC 30 // res 0.5 // k 24
+rna_merged <- FindNeighbors(rna_merged, dims = 1:30, k.param = 24)
+rna_merged <- FindClusters(rna_merged, resolution = 0.5)
+rna_merged <- RunUMAP(rna_merged, dims = 1:30)
+
+umap1 <- DimPlot(rna_merged, group.by = 'sample_id', reduction = "umap", pt.size = 0.1) + 
+  ggtitle("RNA Simple Merge")
+
+umap2 <- DimPlot(rna_merged, group.by = 'seurat_clusters', reduction = "umap", pt.size = 0.1) + 
+    ggtitle("RNA Simple Merge")
+
+ggsave(paste0(output_dir, "RNA_merged_UMAPbysample_.png"), plot = umap1)
+ggsave(paste0(output_dir, "RNA_merged_UMAPbyclusters_.png"), plot = umap2)
+
+saveRDS(
+   object = rna_merged,
+   file = file.path(output_dir, "simplemerged_RNA.Rds")
+)
+```
+
+#### merging ATAC-seq (common peak merge)
+```{r}
+# https://stuartlab.org/signac/articles/merging#merge-objects
+# strategy: making a common set of peaks (by GenomicRanges::reduce) -> simple merge
+
+# outline parallelization parameters
+plan("multicore", workers = 24)
+options(future.globals.maxSize = 100000 * 1024^2) # for 100 Gb RAM
+
+# read in peak sets
+peaks.BL1 <- read.table(
+  file = file.path(input_dir, "/P525_DPayz_BL1/outs/atac_peaks.bed"),
+  col.names = c("chr", "start", "end")
+)
+peaks.BL2 <- read.table(
+  file = file.path(input_dir, "/P525_DPayz_BL2/outs/atac_peaks.bed"),
+  col.names = c("chr", "start", "end")
+)
+peaks.CTL1 <- read.table(
+  file = file.path(input_dir, "/P525_DPayz_CTL1/outs/atac_peaks.bed"),
+  col.names = c("chr", "start", "end")
+)
+peaks.CTL2 <- read.table(
+  file = file.path(input_dir, "/P525_DPayz_CTL2/outs/atac_peaks.bed"),
+  col.names = c("chr", "start", "end")
+)
+peaks.INT1 <- read.table(
+  file = file.path(input_dir, "/P525_DPayz_INT1/outs/atac_peaks.bed"),
+  col.names = c("chr", "start", "end")
+)
+peaks.INT2 <- read.table(
+  file = file.path(input_dir, "/P525_DPayz_INT2/outs/atac_peaks.bed"),
+  col.names = c("chr", "start", "end")
+)
+
+# convert to genomic ranges
+gr.BL1 <- makeGRangesFromDataFrame(peaks.BL1)
+gr.BL2 <- makeGRangesFromDataFrame(peaks.BL2)
+gr.CTL1 <- makeGRangesFromDataFrame(peaks.CTL1)
+gr.CTL2 <- makeGRangesFromDataFrame(peaks.CTL2)
+gr.INT1 <- makeGRangesFromDataFrame(peaks.INT1)
+gr.INT2 <- makeGRangesFromDataFrame(peaks.INT2)
+
+# Create a unified set of peaks to quantify in each dataset
+combined.peaks <- reduce(x = c(gr.BL1, gr.BL2, gr.CTL1, gr.CTL2, gr.INT1, gr.INT2))
+
+# Filter out bad peaks based on length
+peakwidths <- width(combined.peaks)
+combined.peaks <- combined.peaks[peakwidths  < 10000 & peakwidths > 20]
+combined.peaks
+
+# Create fragment object
+# load metadata
+# note that our metric.csv has information about RNA and ATAC, as opposed to just ATAC
+md.BL1 <- read.table(
+  file = file.path(input_dir, "/P525_DPayz_BL1/outs/per_barcode_metrics.csv"),
+  stringsAsFactors = FALSE,
+  sep = ",",
+  header = TRUE,
+  row.names = 1
+)[-1, ] # remove the first row
+
+md.BL2 <- read.table(
+  file = file.path(input_dir, "/P525_DPayz_BL2/outs/per_barcode_metrics.csv"),
+  stringsAsFactors = FALSE,
+  sep = ",",
+  header = TRUE,
+  row.names = 1
+)[-1, ]
+
+md.CTL1 <- read.table(
+  file = file.path(input_dir, "/P525_DPayz_CTL1/outs/per_barcode_metrics.csv"),
+  stringsAsFactors = FALSE,
+  sep = ",",
+  header = TRUE,
+  row.names = 1
+)[-1, ]
+
+md.CTL2 <- read.table(
+  file = file.path(input_dir, "/P525_DPayz_CTL2/outs/per_barcode_metrics.csv"),
+  stringsAsFactors = FALSE,
+  sep = ",",
+  header = TRUE,
+  row.names = 1
+)[-1, ]
+
+md.INT1 <- read.table(
+  file = file.path(input_dir, "/P525_DPayz_INT1/outs/per_barcode_metrics.csv"),
+  stringsAsFactors = FALSE,
+  sep = ",",
+  header = TRUE,
+  row.names = 1
+)[-1, ]
+
+md.INT2 <- read.table(
+  file = file.path(input_dir, "/P525_DPayz_INT2/outs/per_barcode_metrics.csv"),
+  stringsAsFactors = FALSE,
+  sep = ",",
+  header = TRUE,
+  row.names = 1
+)[-1, ]
+
+# subset for already filtered cells
+md.BL1 <- md.BL1[rownames(md.BL1) %in% colnames(BL1), ]
+md.BL2 <- md.BL2[rownames(md.BL2) %in% colnames(BL2), ]
+md.CTL1 <- md.CTL1[rownames(md.CTL1) %in% colnames(CTL1), ]
+md.CTL2 <- md.CTL2[rownames(md.CTL2) %in% colnames(CTL2), ]
+md.INT1 <- md.INT1[rownames(md.INT1) %in% colnames(INT1), ]
+md.INT2 <- md.INT2[rownames(md.INT2) %in% colnames(INT2), ]
+
+# create fragment objects
+frags.BL1 <- CreateFragmentObject(
+  path = file.path(input_dir, "/P525_DPayz_BL1/outs/atac_fragments.tsv.gz"),
+  cells = rownames(md.BL1)
+)
+frags.BL2 <- CreateFragmentObject(
+  path = file.path(input_dir, "/P525_DPayz_BL2/outs/atac_fragments.tsv.gz"),
+  cells = rownames(md.BL2)
+)
+frags.CTL1 <- CreateFragmentObject(
+  path = file.path(input_dir, "/P525_DPayz_CTL1/outs/atac_fragments.tsv.gz"),
+  cells = rownames(md.CTL1)
+)
+frags.CTL2 <- CreateFragmentObject(
+  path = file.path(input_dir, "/P525_DPayz_CTL2/outs/atac_fragments.tsv.gz"),
+  cells = rownames(md.CTL2)
+)
+frags.INT1 <- CreateFragmentObject(
+  path = file.path(input_dir, "/P525_DPayz_INT1/outs/atac_fragments.tsv.gz"),
+  cells = rownames(md.INT1)
+)
+frags.INT2 <- CreateFragmentObject(
+  path = file.path(input_dir, "/P525_DPayz_INT2/outs/atac_fragments.tsv.gz"),
+  cells = rownames(md.INT2)
+)
+
+# Quantifying peaks
+BL1.counts <- FeatureMatrix(
+  fragments = frags.BL1,
+  features = combined.peaks,
+  cells = rownames(md.BL1)
+)
+
+BL2.counts <- FeatureMatrix(
+  fragments = frags.BL2,
+  features = combined.peaks,
+  cells = rownames(md.BL2)
+)
+
+CTL1.counts <- FeatureMatrix(
+  fragments = frags.CTL1,
+  features = combined.peaks,
+  cells = rownames(md.CTL1)
+)
+
+CTL2.counts <- FeatureMatrix(
+  fragments = frags.CTL2,
+  features = combined.peaks,
+  cells = rownames(md.CTL2)
+)
+
+INT1.counts <- FeatureMatrix(
+  fragments = frags.INT1,
+  features = combined.peaks,
+  cells = rownames(md.INT1)
+)
+
+INT2.counts <- FeatureMatrix(
+  fragments = frags.INT2,
+  features = combined.peaks,
+  cells = rownames(md.INT2)
+)
+
+# Create objects
+BL1_assay <- CreateChromatinAssay(BL1.counts, fragments = frags.BL1)
+BL1_ATAC <- CreateSeuratObject(BL1_assay, assay = "ATAC", meta.data=md.BL1)
+
+BL2_assay <- CreateChromatinAssay(BL2.counts, fragments = frags.BL2)
+BL2_ATAC <- CreateSeuratObject(BL2_assay, assay = "ATAC", meta.data=md.BL2)
+
+CTL1_assay <- CreateChromatinAssay(CTL1.counts, fragments = frags.CTL1)
+CTL1_ATAC <- CreateSeuratObject(CTL1_assay, assay = "ATAC", meta.data=md.CTL1)
+
+CTL2_assay <- CreateChromatinAssay(CTL2.counts, fragments = frags.CTL2)
+CTL2_ATAC <- CreateSeuratObject(CTL2_assay, assay = "ATAC", meta.data=md.CTL2)
+
+INT1_assay <- CreateChromatinAssay(INT1.counts, fragments = frags.INT1)
+INT1_ATAC <- CreateSeuratObject(INT1_assay, assay = "ATAC", meta.data=md.INT1)
+
+INT2_assay <- CreateChromatinAssay(INT2.counts, fragments = frags.INT2)
+INT2_ATAC <- CreateSeuratObject(INT2_assay, assay = "ATAC", meta.data=md.INT2)
+```
+
+#### saving each shared peak object
+```{r}
+# save these objects since the count took forever!
+saveRDS(
+   object = BL1_ATAC,
+   file = file.path(output_dir, "BL1_ATAC_commonpeaks.Rds")
+)
+saveRDS(
+   object = BL2_ATAC,
+   file = file.path(output_dir, "BL2_ATAC_commonpeaks.Rds")
+)
+saveRDS(
+   object = CTL1_ATAC,
+   file = file.path(output_dir, "CTL1_ATAC_commonpeaks.Rds")
+)
+saveRDS(
+   object = CTL2_ATAC,
+   file = file.path(output_dir, "CTL2_ATAC_commonpeaks.Rds")
+)
+saveRDS(
+   object = INT1_ATAC,
+   file = file.path(output_dir, "INT1_ATAC_commonpeaks.Rds")
+)
+saveRDS(
+   object = INT2_ATAC,
+   file = file.path(output_dir, "INT2_ATAC_commonpeaks.Rds")
+)
+```
+
+#### merge shared peak objects and check for integration
+```{r}
+# add information to identify dataset of origin
+BL1_ATAC$dataset <- 'BL1'
+BL2_ATAC$dataset <- 'BL2'
+CTL1_ATAC$dataset <- 'CTL1'
+CTL2_ATAC$dataset <- 'CTL2'
+INT1_ATAC$dataset <- 'INT1'
+INT2_ATAC$dataset <- 'INT2'
+
+# merge all datasets, adding a cell ID to make sure cell names are unique
+atac_merged <- merge(
+  x = BL1_ATAC,
+  y = list(BL2_ATAC, CTL1_ATAC, CTL2_ATAC, INT1_ATAC, INT2_ATAC),
+  add.cell.ids = c("BL1", "BL2", "CTL1", "CTL2", "INT1", "INT2")
+)
+atac_merged[["ATAC"]]
+
+# Analyze
+atac_merged <- RunTFIDF(atac_merged)
+atac_merged <- FindTopFeatures(atac_merged, min.cutoff = 20)
+atac_merged <- RunSVD(atac_merged)
+atac_merged <- RunUMAP(atac_merged, dims = 2:50, reduction = 'lsi', reduction.name = "umap.atac", reduction.key = "atacUMAP_")
+
+# Save atac_merged object
+saveRDS(
+   object = atac_merged,
+   file = file.path(output_dir, "combined_ATAC_commonpeaks.Rds")
+)
+```
+
+#### Creating multiome seurat object (combining preprocessed RNA and ATAC)
+```{r}
+# RNA seurat object
+rna <- rna_merged
+rna@assays$ATAC <- NULL
+# ATAC seurat object
+atac <- atac_merged
+
+# sanity check for cell commonality - the three numbers should be the same
+common_cells <- intersect(colnames(rna), colnames(atac))
+if (length(common_cells) != length(colnames(rna))) {
+  cat("CELL NUMBERS DO NOT MATCH")
+}
+if (length(common_cells) != length(colnames(atac))) {
+  cat("CELL NUMBERS DO NOT MATCH")
+}
+
+rna  <- subset(rna,  cells = common_cells)
+atac <- subset(atac, cells = common_cells)
+
+# Make sure the cell order is identical
+rna  <- rna[, common_cells]
+atac <- atac[, common_cells]
+
+# Make sure the ATAC assay is the default in the atac object
+DefaultAssay(atac) <- "ATAC"
+
+# Add ATAC assay to the RNA object
+rna[["ATAC"]] <- atac[["ATAC"]]   # or atac@assays$ATAC
+multiome <- rna
+
+# Copying over metadata
+atac_meta <- atac@meta.data
+multiome@meta.data <- cbind(
+  multiome@meta.data,
+  atac_meta[common_cells, setdiff(colnames(atac_meta), colnames(multiome@meta.data))]
+)
+
+# Analyze (TODO: double check since it doesn't seem to be transferred over)
+DefaultAssay(multiome) <- "ATAC"
+multiome <- RunTFIDF(multiome)
+multiome <- FindTopFeatures(multiome, min.cutoff = 20)
+multiome <- RunSVD(multiome)
+multiome <- RunUMAP(multiome, dims = 2:50, reduction = 'lsi', reduction.name = "umap.atac", reduction.key = "atacUMAP_")
+
+# Group replicates together
+# Check for consistent labelling between assay layers
+# sample_id = from RNA ; dataset = from ATAC
+if (all(multiome$sample_id == multiome$dataset)) {
+  cat("OK! CELL SAMPLE IDENTITY MIATCHED BETWEEN ATAC AND RNA")
+  cat("\n")
+}
+
+# Strip the number from the dataset column
+dataset_new <- str_sub(multiome$dataset, 1, -2)
+multiome$dataset <- dataset_new
+
+saveRDS(
+   object = multiome,
+   file = file.path(output_dir, "multiome.rds")
+)
+```
+### CLUSTER ANNOTATION
+#### Read in differential genes of clusters
+```{r}
+# Conversion to count from SCT
+options(future.globals.maxSize = 8 * 1024^3)
+rna_merged <- PrepSCTFindMarkers(rna_merged, verbose = FALSE)
+
+# Make sure identities are clusters
+Idents(rna_merged) <- "seurat_clusters"
+DefaultAssay(rna_merged) <- "SCT"
+
+markers <- FindAllMarkers(
+  rna_merged,
+  assay = "SCT",
+  only.pos = TRUE,        # only upregulated markers
+  min.pct = 0.25,
+  logfc.threshold = 0.25
+)
+
+degs_by_cluster <- markers %>% group_split(cluster) 
+
+top10 <- markers %>%
+  group_by(cluster) %>%
+  slice_max(order_by = avg_log2FC, n = 10, with_ties = FALSE) %>%
+  ungroup()
+
+top50 <- markers %>%
+  group_by(cluster) %>%
+  slice_max(order_by = avg_log2FC, n = 50, with_ties = FALSE) %>%
+  ungroup()
+
+allmarkers_file <- file.path(output_dir, "cluster_markers_all.csv")
+top10markers_file <- file.path(output_dir, "cluster_markers_top10.csv")
+top50markers_file <- file.path(output_dir, "cluster_markers_top50.csv")
+
+write.csv(markers, allmarkers_file, row.names = FALSE)
+write.csv(top10, top10markers_file, row.names = FALSE)
+write.csv(top50, top50markers_file, row.names = FALSE)
+
+
+top10
+```
+
+#### Cluster calling
+```{r}
+cluster_to_type <- c(
+  "0"  = "Fibroblasts (ECM; collagen-rich)",
+  "1"  = "Fibroblasts (ECM; fibrillin-rich)",
+  "2"  = "Myofibroblasts/SMCs",
+  "3"  = "Progenitor Cells",
+  "4"  = "Chondrogenic Lineage?",
+  "5"  = "Ribosome Protein High Cells",
+  "6"  = "Lymphatic Endothelial Cells",
+  "7"  = "Macrophages",
+  "8"  = "Osteochondral Progenitors",
+  "9"  = "Cycling cells?",
+  "10" = "Epithelial (Simple/Glandular)",
+  "11" = "Vascular Mesenchymal Cells?",
+  "12" = "Osteoblasts",
+  "13" = "Epithelial (Basal)",
+  "14" = "Vascular Endothelial Cells",
+  "15" = "Mast Cells",
+  "16" = "Osteoclasts",
+  "17" = "Synovial Fibroblasts"
+)
+
+multiome$celltype_putative <- unname(cluster_to_type[as.character(multiome$seurat_clusters)])
+anno <- DimPlot(multiome, group.by = 'celltype_putative', reduction = c("umap"), pt.size = 0.1, repel = TRUE, label = TRUE, label.size = 3) + ggtitle("multiome") + NoLegend()
+ggsave(filename = file.path(output_dir, "multiome_ClusterAnnotations.png"), plot = anno)
+
+saveRDS(
+   object = multiome,
+   file = file.path(output_dir, "multiome.rds")
+)
+```
+
+#### NEW: Pulling barcodes from each cell cluster out for pseudobulking peak calling (for sinto)
+```{r}
+output_dir = "/n/netscratch/whited_lab/Lab/sycwu/multiome_pseudobulk/20260209_attempt2/"
+for (sample_id in unique(multiome$sample_id)) {
+  md <- multiome@meta.data
+  md_sub <- md[md$sample_id == sample_id, ]
+  
+  celltype_filename <- md_sub$celltype_putative
+  celltype_filename <- gsub(" ", "", celltype_filename)
+  celltype_filename <- gsub("/", "OR", celltype_filename)
+  
+  out <- data.frame(
+    cell_barcode  = md_sub$gex_barcode,
+    celltype = celltype_filename
+  )
+
+  write.table(
+    out,
+    file = file.path(output_dir, "spreadsheets", paste0(sample_id, "_barcodes_celltype.csv")),
+    sep = "\t",
+    quote = FALSE,
+    row.names = FALSE,
+    col.names = FALSE
+  )
+  
+  out <- data.frame(
+    cell_barcode  = md_sub$gex_barcode,
+    tag = "ID",
+    ID_barcode = rownames(md_sub)
+  )
+  
+  write.table(
+    out,
+    file = file.path(output_dir, "spreadsheets", paste0(sample_id, "_barcodes_id.csv")),
+    sep = "\t",
+    quote = FALSE,
+    row.names = FALSE,
+    col.names = FALSE
+  )
+}
+```
+
+#### Check BAM files
+```{r}
+prefix <- "BL2"
+celltype <- "Osteoblasts"
+# format celltype for filename purposes
+celltype_filename <- celltype
+celltype_filename <- gsub(" ", "", celltype_filename)
+celltype_filename <- gsub("/", "OR", celltype_filename)
+
+filtered_BAM_file <- file.path(output_dir, "BAM_files", celltype_filename, paste0(prefix, "_", celltype_filename, ".bam"))
+
+### DOUBLE CHECK
+bf <- BamFile(filtered_BAM_file, yieldSize = 10)
+countBam(
+  bf,
+  param = ScanBamParam(tag = "CB")
+) ## check # of records
+sb <- scanBam(
+  bf,
+  yieldSize = 10
+)
+```
+
+### (POST PREPROCESSING + ANNOTATIONS): RUN HERE TO LOAD SAVED OBJECTS
+#### read in stored objects: individual QCed samples, ATAC shared peaks, ATAC combined, RNA combined
+```{r}
+# read in preprocessed ATAC+RNA seq objects
+file = file.path(output_dir, "BL1_preprocessedformerge.Rds")
+BL1 <- readRDS(file)
+
+file = file.path(output_dir, "BL2_preprocessedformerge.Rds")
+BL2 <- readRDS(file)
+
+file = file.path(output_dir, "CTL1_preprocessedformerge.Rds")
+CTL1 <- readRDS(file)
+
+file = file.path(output_dir, "CTL2_preprocessedformerge.Rds")
+CTL2 <- readRDS(file)
+
+file = file.path(output_dir, "INT1_preprocessedformerge.Rds")
+INT1 <- readRDS(file)
+
+file = file.path(output_dir, "INT2_preprocessedformerge.Rds")
+INT2 <- readRDS(file)
+
+# read in saved individual ATAC seq objects as necessary 
+file = file.path(output_dir, "BL1_ATAC_commonpeaks.Rds")
+BL1_ATAC <- readRDS(file)
+
+file = file.path(output_dir, "BL2_ATAC_commonpeaks.Rds")
+BL2_ATAC <- readRDS(file)
+
+file = file.path(output_dir, "CTL1_ATAC_commonpeaks.Rds")
+CTL1_ATAC <- readRDS(file)
+
+file = file.path(output_dir, "CTL2_ATAC_commonpeaks.Rds")
+CTL2_ATAC <- readRDS(file)
+
+file = file.path(output_dir, "INT1_ATAC_commonpeaks.Rds")
+INT1_ATAC <- readRDS(file)
+
+file = file.path(output_dir, "INT2_ATAC_commonpeaks.Rds")
+INT2_ATAC <- readRDS(file)
+
+# read in saved combined ATAC seq object as necessary 
+file = file.path(output_dir, "combined_ATAC_commonpeaks.Rds")
+atac_merged <- readRDS(file)
+
+# read in saved simple merged RNA seq object as necessary 
+file = file.path(output_dir, "simplemerged_RNA.Rds")
+rna_merged <- readRDS(file)
+
+# read in multiome object as necessary 
+file = file.path(output_dir, "multiome.rds")
+multiome <- readRDS(file)
+```
+
+#### check object umaps to ensure integrity
+```{r}
+DimPlot(rna_merged, group.by = 'sample_id', reduction = c("umap"), pt.size = 0.1) + ggtitle("RNA merged")
+DimPlot(multiome, group.by = 'seurat_clusters', reduction = c("umap"), pt.size = 0.1) + ggtitle("multiome (RNA)")
+```
+
+### IGNORE: Manual Clustering Testing
+```{r}
+# testing parameters
+# PC 30 // res 0.5 // k 24
+rna_merged <- FindNeighbors(rna_merged, dims = 1:30, k.param = 24)
+rna_merged <- FindClusters(rna_merged, resolution = 0.5)
+rna_merged <- RunUMAP(rna_merged, dims = 1:30)
+p1<-DimPlot(rna_merged, reduction = c("umap"), pt.size = 0.1) + ggtitle("From our preprocessing pipeline")
+p1
+```
+
+```{r}
+p1<-FeaturePlot(
+  rna_merged,
+  features = "CDH5"
+)
+p1
+```
+
+### IGNORE: Cluster stability check to determine PCA/clustering parameters
+```{r}
+library(scclusteval)
+
+# read in saved simple merged RNA seq object as necessary 
+file = file.path(output_dir, "simplemerged_RNA.Rds")
+pbmc<-readRDS(file)
+
+subsample_idents<-readRDS("/n/netscratch/whited_lab/Lab/sycwu/pyflow_seurat_parameter/gather_subsample.rds")
+fullsample_idents<-readRDS("/n/netscratch/whited_lab/Lab/sycwu/pyflow_seurat_parameter/gather_full_sample.rds")
+```
+
+```{r}
+# make a Raincloud plot for every combination of the parameters.
+subsample_idents_list<- subsample_idents %>% 
+  group_by(pc, resolution, k_param) %>% 
+  nest()
+
+subsample_idents_list2<- subsample_idents_list %>%
+  mutate(plot = map(data, ~JaccardRainCloudPlot(.x$original_ident, .x$recluster_ident) + geom_hline(yintercept = c(0.6, 0.75), linetype = 2)))
+```
+
+```{r}
+# test that subsample raincloud params can work
+p1<- subsample_idents_list2 %>% 
+  filter(resolution == 0.3, pc == 30, k_param == 16) %>%
+  pull(plot) %>% `[[`(1)  + ggtitle("resolution = 0.6, pc = 20, k.param = 8")
+
+p2<- subsample_idents_list2 %>% 
+  filter(resolution == 0.4, pc == 30, k_param == 16) %>%
+  pull(plot) %>% `[[`(1)  + ggtitle("resolution = 1.4, pc = 20, k.param = 8")
+
+
+p1/ p2
+```
+
+```{r}
+# to save to disk, give a name for each png
+subsample_idents_list2 <- mutate(subsample_idents_list2, file_name = paste0("/n/netscratch/whited_lab/Lab/sycwu/pyflow_seurat_parameter/rainclouds_01112026/","PC_",pc, "_", "resolution_",resolution, "_", "k_", k_param, ".png"))
+
+# save to disk
+walk2(subsample_idents_list2$file_name, subsample_idents_list2$plot, ggsave, width = 10, height = 6.5)
+```
+
+```{r}
+# ?AssignStableCluster
+## for all sets of parameters
+stable_clusters<- subsample_idents_list %>%
+  mutate(stable_cluster = map(data, ~ AssignStableCluster(.x$original_ident,
+                                                          .x$recluster_ident,
+                                                          jaccard_cutoff = 0.8,
+                                                          method = "jaccard_percent", 
+                                                          percent_cutoff = 0.8)))
+```
+
+```{r}
+# plot percentage cells in stable cluster
+ParameterSetScatterPlot(stable_clusters = stable_clusters,
+                        fullsample_idents = fullsample_idents,
+                        x_var = "k_param",
+                        y_var = "percentage",
+                        facet_rows = "resolution",
+                        facet_cols = "pc") +
+  ggtitle("percentage of cells in stable clusters")
+```
+
+```{r}
+# read in full sampled object as necessary 
+file = file.path("/n/netscratch/whited_lab/Lab/sycwu/pyflow_seurat_parameter/full_sample_preprocess/full_sample_k_28_resolution_0.5_PC_35.rds")
+fullobject <- readRDS(file)
+DimPlot(fullobject, reduction = c("umap"), pt.size = 0.1) + ggtitle("RNA merged")
+```
+```{r}
+# updated 1/8/2026 with parameters: PC 35 // res 0.4 // k 24
+rna_merged <- RunPCA(rna_merged, npcs=150, verbose = FALSE)
+rna_merged <- FindNeighbors(rna_merged, dims = 1:35, k.param = 24)
+rna_merged <- FindClusters(rna_merged, resolution = 0.3, n.start = 100)
+rna_merged <- RunUMAP(rna_merged, dims = 1:35)
+DimPlot(rna_merged, reduction = c("umap"), pt.size = 0.1) + ggtitle("From our preprocessing pipeline")
+
+fullobject <- RunPCA(fullobject, npcs=150, verbose = FALSE)
+fullobject <- FindNeighbors(fullobject, dims = 1:35, k.param = 24)
+fullobject <- FindClusters(fullobject, resolution = 0.3, n.start = 100)
+fullobject <- RunUMAP(fullobject, dims = 1:35)
+DimPlot(fullobject, reduction = c("umap"), pt.size = 0.1) + ggtitle("From stability pipeline")
+```
+
+### IGNORE: Marker/Feature checks for annotations
+#### IGNORE: Quick check of gene features
+```{r}
+p1 <- FeaturePlot(
+  rna_merged,
+  features = c("LOC138516914"),
+) + plot_annotation(title = "blastema cells")
+p1
+```
+```{r}
+Idents(rna_merged) <- "seurat_clusters"
+
+#Kzd2 = LOC138516914
+p2 <- DotPlot(
+  rna_merged,
+  #group.by = c("sample_id"),
+  features = c("RGS5","PDGFRB","CSPG4","ACTA2","TAGLN","MYH11")) +
+  RotatedAxis()
+p2
+```
+#### IGNORE: Subsetting cluster 3 (blastema / progenitors)
+```{r}
+# Subset cluster 3 to see if other cell types can be identified
+sub <- subset(rna_merged, subset = seurat_clusters == "3")
+
+sub <- RunPCA(sub, npcs=150, verbose = FALSE)
+sub <- FindNeighbors(sub, dims = 1:35, k.param = 24)
+sub <- FindClusters(sub, resolution = 0.3, n.start = 100)
+sub <- RunUMAP(sub, dims = 1:35)
+DimPlot(sub, reduction = c("umap"), pt.size = 0.1) + ggtitle("Only cluster 3")
+
+# Conversion to count from SCT
+options(future.globals.maxSize = 8 * 1024^3)
+sub <- PrepSCTFindMarkers(sub, verbose = FALSE)
+
+# Make sure identities are clusters
+Idents(sub) <- "seurat_clusters"
+DefaultAssay(sub) <- "SCT"
+
+markers_c3 <- FindAllMarkers(
+  sub,
+  assay = "SCT",
+  only.pos = TRUE,        # only upregulated markers
+  min.pct = 0.25,
+  logfc.threshold = 0.25
+)
+
+degs_by_cluster_c3 <- markers_c3 %>% group_split(cluster) 
+
+top10_c3 <- markers_c3 %>%
+  group_by(cluster) %>%
+  slice_max(order_by = avg_log2FC, n = 10, with_ties = FALSE) %>%
+  ungroup()
+
+allmarkers_file <- file.path(output_dir, "cluster3_markers_all.csv")
+top10markers_file <- file.path(output_dir, "cluster3_markers_top10.csv")
+
+write.csv(markers_c3, allmarkers_file, row.names = FALSE)
+write.csv(top10_c3, top10markers_file, row.names = FALSE)
+
+top10_c3
+
+p1 <- FeaturePlot(
+  sub,
+  features = c("TUBB3"),
+  cols = c("yellow", "blue"),
+  pt.size = 0.01
+) + plot_annotation(title = "cluster 3 only")
+p1
+
+p2 <- DotPlot(
+  sub,
+  features = c("COL1A1", "COL3A1", "COL6A1")) +
+  RotatedAxis()
+p2
+```
+
+#### IGNORE: Checking QC features
+```{r}
+rna_merged <- PercentageFeatureSet(rna_merged, pattern = "^RP[SL]", col.name = "percent.ribo")
+
+DimPlot(rna_merged, group.by = 'seurat_clusters', reduction = c("umap"), pt.size = 0.1, label=TRUE) + ggtitle("RNA merged")
+p1 <- FeaturePlot(
+  rna_merged,
+  features = c("percent.ribo"),
+  cols = c("yellow", "blue"),
+  pt.size = 0.01
+) + plot_annotation(title = "cluster 5?")
+p1
+```
+
+
+#### IGNORE: Plotting some cell type markers
+```{r}
+# Cluster 1
+p1 <- FeaturePlot(
+  rna_merged,
+  features = c("PDGFRA", "DCN", "LUM", "COL1A1", "COL1A2"),
+  ncol = 3
+) + plot_annotation(title = "fibroblasts")
+ggsave(paste0(output_dir, "markers_fibroblasts.png"), plot = p1)
+
+# Cluster 2
+p1 <- FeaturePlot(
+  rna_merged,
+  features = c("RGS5","CSPG4","PDGFRB","MCAM","ACTA2","TAGLN"),
+  ncol = 3
+) + plot_annotation(title = "mural/SMC")
+ggsave(paste0(output_dir, "markers_SMC.png"), plot = p1)
+
+# Cluster 6
+p1 <- FeaturePlot(
+  rna_merged,
+  features = c("PECAM1","VWF","KDR","PLVAP","LYVE1","PROX1"),
+  ncol = 3
+) + plot_annotation(title = "endothelium/lymphatic")
+ggsave(paste0(output_dir, "markers_endothelium.png"), plot = p1)
+
+# Cluster 8
+p1 <- FeaturePlot(
+  rna_merged,
+  features = c("SOX9","ACAN","COL2A1","COL10A1","PRG4"),
+  ncol = 3
+) + plot_annotation(title = "cartilage")
+ggsave(paste0(output_dir, "markers_cartilage.png"), plot = p1)
+
+# Cluster 12
+p1 <- FeaturePlot(
+  rna_merged,
+  features = c("ALPL","SP7","BGLAP","IBSP", "RUNX2"),
+  ncol = 2
+) + plot_annotation(title = "osteoblast")
+ggsave(paste0(output_dir, "markers_osteoblast.png"), plot = p1)
+
+# Cluster 16
+p1 <- FeaturePlot(
+  rna_merged,
+  features = c("ACP5","CTSK","DCSTAMP","SIGLEC15"),
+  ncol = 2
+) + plot_annotation(title = "osteoclast")
+ggsave(paste0(output_dir, "markers_osteoclast.png"), plot = p1)
+
+# Cluster 9
+p1 <- FeaturePlot(
+  rna_merged,
+  features = c("MKI67","TOP2A"),
+  ncol = 2
+) + plot_annotation(title = "cycling")
+ggsave(paste0(output_dir, "markers_cycling.png"), plot = p1)
+
+# Cluster 13
+p1 <- FeaturePlot(
+  rna_merged,
+  features = c("ITGB4", "COL17A1", "KRT5", "KRT14", "EPCAM"),
+  ncol = 3
+) +
+  plot_annotation(title = "Epithelial / Basal epithelial cells")
+ggsave(paste0(output_dir, "markers_epithelial.png"), plot = p1)
+
+# Cluster???
+p1 <- FeaturePlot(
+  rna_merged,
+  features = c("KRT5", "KRT14", "TP63", "COL17A1", "ITGB4"),
+  ncol = 3
+) +
+  plot_annotation(title = "Basal epithelial cells")
+ggsave(paste0(output_dir, "markers_basalepithelial.png"), plot = p1)
+```
+### ATAC DIFFERENTIAL PEAK ANALYSIS
+#### See how ATAC UMAP looks
+```{r}
+DimPlot(multiome, group.by = 'celltype_putative', reduction = c("umap.atac"), pt.size = 0.1, repel = TRUE, label = TRUE, label.size = 3) + NoLegend() + ggtitle("multiome (ATAC)")
+DimPlot(multiome, group.by = 'sample_id', reduction = c("umap.atac"), pt.size = 0.1) + ggtitle("multiome (ATAC)")
+```
+#### Cluster-specific peak analysis of INTACT vs CONTRALATERAL
+```{r}
+# Find differential peaks for fibroblast clusters
+# https://stuartlab.org/signac/articles/pbmc_vignette.html
+# change back to working with peaks instead of gene activities
+DefaultAssay(multiome) <- 'ATAC'
+Idents(multiome) <- "celltype_putative"
+
+# Take all cells in cluster celltype_putative, 
+# and find markers that separate cells in the 'INT' dataset from the 'CTL' or 'BL' dataset
+# https://satijalab.org/seurat/reference/findmarkers
+for (celltype in unique(multiome$celltype_putative)) {
+  # format celltype for filename purposes
+  celltype_filename <- celltype
+  celltype_filename <- gsub(" ", "", celltype_filename)
+  celltype_filename <- gsub("/", "OR", celltype_filename)
+  
+  # CTL vs INT
+  da_peaks <- FindMarkers(
+    multiome, 
+    ident.1 = "CTL", 
+    ident.2 = "INT", 
+    group.by = 'dataset', 
+    subset.ident = celltype,
+    test.use = 'wilcox',
+    min.pct = 0.1,
+  )
+  # TODO: Review thresholds
+  open_CTL <- da_peaks[da_peaks$avg_log2FC > 0.25 & da_peaks$p_val_adj < 0.05, ]
+  open_INT <- da_peaks[da_peaks$avg_log2FC < -0.25 & da_peaks$p_val_adj < 0.05, ]
+  
+  #closest_genes_CTL <- ClosestFeature(multiome, regions = rownames(open_CTL))
+  #closest_genes_INT <- ClosestFeature(multiome, regions = rownames(open_INT))
+  
+  CTLvsINT_file <- file.path(output_dir, paste0("DApeaks/", celltype_filename, "_DApeaks_CTLvsINT.csv"))
+  INTvsCTL_file <- file.path(output_dir, paste0("DApeaks/", celltype_filename, "_DApeaks_INTvsCTL.csv"))
+  write.csv(open_CTL, CTLvsINT_file, row.names = TRUE)
+  write.csv(open_INT, INTvsCTL_file, row.names = TRUE)
+
+  # There are no BLs in Synovial Fibroblasts cluster
+  if (celltype != c("Synovial Fibroblasts")) {
+    # BL vs INT
+    da_peaks <- FindMarkers(
+      multiome, 
+      ident.1 = "BL", 
+      ident.2 = "INT", 
+      group.by = 'dataset', 
+      subset.ident = celltype,
+      test.use = 'wilcox',
+      min.pct = 0.1
+    )
+    
+    # TODO: Review thresholds
+    open_BL <- da_peaks[da_peaks$avg_log2FC > 0.25 & da_peaks$p_val_adj < 0.05, ]
+    open_INT <- da_peaks[da_peaks$avg_log2FC < -0.25 & da_peaks$p_val_adj < 0.05, ]
+    
+    BLvsINT_file <- file.path(output_dir, paste0("DApeaks/", celltype_filename, "_DApeaks_BLvsINT.csv"))
+    INTvsBL_file <- file.path(output_dir, paste0("DApeaks/", celltype_filename, "_DApeaks_INTvsBL.csv"))
+    write.csv(open_BL, BLvsINT_file, row.names = TRUE)
+    write.csv(open_INT, INTvsBL_file, row.names = TRUE)
+  }
+  
+  # Compile relative numbers of cells per cluster, per dataset
+  numberofcells <- table(
+    multiome$dataset[multiome$celltype_putative == celltype]
+  )
+  numberofcells_file <- file.path(output_dir, paste0("DApeaks/", celltype_filename, "numberofcells.csv"))
+  write.csv(numberofcells, numberofcells_file, row.names = TRUE)
+}
+```
+
+#### Sanity check for motifs - can we align findings with sysact paper?
+```{r}
+# TODO: Pending BSgenome of newest genome
+ax_genome <-
+
+# Get a list of motif position frequency matrices from the JASPAR database
+pfm <- getMatrixSet(
+  x = JASPAR2020,
+  opts = list(collection = "CORE", tax_group = 'vertebrates', all_versions = FALSE)
+)
+
+# add motif information
+multiome <- AddMotifs(
+  object = multiome,
+  genome = ax_genome,
+  pfm = pfm
+)
+
+```
+
+#### Checking whether specific subsets of cells have DA peaks
+```{r}
+# TODO: double check that this is how you get the normalized counts?
+DefaultAssay(multiome) <- "SCT"
+
+prlr_exp <- FetchData(multiome, vars = "PRLR")[,1]
+cutoff <- quantile(prlr_exp, 0.90, na.rm = TRUE)   # top 10%
+
+Idents(multiome, WhichCells(object = multiome, expression = PRLR > cutoff)) <- 'prlr.pos'
+Idents(multiome, WhichCells(object = multiome, expression = PRLR <= cutoff)) <- 'prlr.neg'
+
+PRLRcellcounts <- table(
+  PRLR_status = Idents(multiome),
+  Dataset = multiome$dataset
+)
+
+PRLRcellcounts_file <- file.path(output_dir, "PRLRcellcounts.csv")
+write.csv(PRLRcellcounts, PRLRcellcounts_file, row.names = TRUE)
+
+# Looks like some blastema cells have more PRLR than others, let's check them out!
+sub <- subset(multiome, subset = celltype_putative == "Progenitor Cells")
+
+# RNA
+# Conversion to count from SCT
+options(future.globals.maxSize = 8 * 1024^3)
+sub <- PrepSCTFindMarkers(sub, verbose = FALSE)
+
+genes <- FindMarkers(
+  sub, 
+  assay = "SCT",
+  ident.1 = 'prlr.pos', 
+  ident.2 = 'prlr.neg',
+  only.pos = FALSE,
+  min.pct = 0.25,
+  logfc.threshold = 0.25
+)
+
+allmarkers_file <- file.path(output_dir, "PRLRprogenitors_markers_all.csv")
+write.csv(genes, allmarkers_file, row.names = TRUE)
+
+
+# ATAC 
+da_peaks <- FindMarkers(
+  sub, 
+  assay = "ATAC",
+  ident.1 = "prlr.pos", 
+  ident.2 = "prlr.neg", 
+  #group.by = 'dataset', 
+  #subset.ident = celltype,
+  test.use = 'wilcox',
+  min.pct = 0.1,
+)
+# TODO: Review thresholds
+#open_PRLRpos <- da_peaks[da_peaks$avg_log2FC > 0.25 & da_peaks$p_val_adj < 0.05, ]
+#open_PRLRneg <- da_peaks[da_peaks$avg_log2FC < -0.25 & da_peaks$p_val_adj < 0.05, ]
+open_PRLRpos <- da_peaks[da_peaks$avg_log2FC > 0.25, ]
+open_PRLRneg <- da_peaks[da_peaks$avg_log2FC < -0.25, ]
+
+# convert to absolute NCBI coordinates
+open_PRLRpos_NCBIlist <- list()
+for (peak in rownames(open_PRLRpos)) {
+  open_PRLRpos_NCBIlist <- append(open_PRLRpos_NCBIlist, convert_to_ncbi(peak))
+}
+rownames(open_PRLRpos) <- open_PRLRpos_NCBIlist
+
+open_PRLRpos_file <- file.path(output_dir, paste0("DApeaks/", "Progenitors_open_PRLRpos.csv"))
+open_PRLRneg_file <- file.path(output_dir, paste0("DApeaks/", "Progenitors_open_PRLRneg.csv"))
+write.csv(open_PRLRpos, open_PRLRpos_file, row.names = TRUE)
+write.csv(open_PRLRneg, open_PRLRneg_file, row.names = TRUE)
+
+```
+
+#### Finding markers of PRLR positive cell no matter the cell identify or dataset
+```{r}
+# Conversion to count from SCT
+options(future.globals.maxSize = 8 * 1024^3)
+multiome <- PrepSCTFindMarkers(multiome, verbose = FALSE)
+
+genes <- FindMarkers(
+  multiome, 
+  assay = "SCT",
+  ident.1 = 'prlr.pos', 
+  ident.2 = 'prlr.neg',
+  only.pos = TRUE,
+  min.pct = 0.25,
+  logfc.threshold = 0.25
+)
+
+allmarkers_file <- file.path(output_dir, "PRLRcluster_markers_all.csv")
+write.csv(genes, allmarkers_file, row.names = FALSE)
+
+```
+
+### ATAC PEAK PLOTTING
+#### Convert from OUR CHUNKING -> absolute
+```{r}
+convert_to_ncbi <- function(input) {
+  # Remove anything after ^ for the chromosome contig
+  chr_base <- sub("\\^.*", "", input)
+  chr_base <- sub("-", "_", chr_base)
+
+  # Extract coordinates - looking for last two numbers separated by -
+  coords <- str_extract_all(input, "\\d+")[[1]]
+  if (length(coords) < 2) {
+    return(NA)
+  }
+  coords <- tail(coords, 2)
+  start <- as.integer(coords[1])
+  end <- as.integer(coords[2])
+  
+  # Extract offset
+  offset <- str_extract_all(input, "o\\d+")[[1]]
+  offset <- sub("o", "", offset)
+  offset <- as.integer(offset)
+  
+  # Convert start and ends
+  newstart <- offset + start 
+  newend <- offset + end
+  
+  output <- paste0(chr_base, c(":"), newstart, c("-"), newend)
+  return(output)
+}
+
+# test <- "NC-090936.1^c2^o570253866-71731196-71732122"
+# convert_to_ncbi(test)
+# should be NC_090936.1:641985062-641985988
+```
+
+#### Convert a custom ROI from no chunking -> OUR CHUNKING
+```{r}
+# Read TSV and add "chunk" per chromosome (c0, c1, c2, ...) in row order
+chunkTSV = "/n/whited_lab/Users/sycwu/chunkedUKYgenome/chunks.tsv"
+df <- read.delim(chunkTSV, stringsAsFactors = FALSE, check.names = FALSE)
+
+# Be tolerant of column name case ("Chromosome" vs "chromosome")
+colnames(df) <- sub("^chromosome$", "Chromosome", colnames(df), ignore.case = TRUE)
+
+# Basic checks
+required <- c("Chromosome", "brkpt", "chunksize_offset_frac")
+missing <- setdiff(required, colnames(df))
+if (length(missing)) stop("Missing required columns: ", paste(missing, collapse = ", "))
+
+# For each Chromosome group, assign c0, c1, c2 ... in the order rows appear
+idx <- with(df, ave(brkpt, Chromosome, FUN = function(x) seq_along(x) - 1))
+df$chunk <- paste0("c", idx+1)
+```
+
+```{r}
+convert_atac_offsets_ncbi <- function(input) {
+  # Parse the input
+  
+  # Remove anything after : for the chromosome contig
+  chr_base <- sub("\\:.*", "", input)
+  #message(chr_base)
+  
+  # Extract coordinates - looking for last two numbers separated by -
+  coords <- str_extract_all(input, "\\d+")[[1]]
+  if (length(coords) < 2) {
+    return(NA)
+  }
+  coords <- tail(coords, 2)
+  start <- coords[1]
+  end <- coords[2]
+  
+  # Convert start and ends
+  # find the correct row in the dataframe
+  s_idx <- which(df$Chromosome == chr_base)
+  
+  # start by assuming that it's the last chunk (easier logic flow)
+  last_match <- tail(s_idx, n=1)
+  chunk <- df[last_match, c("chunk")]
+  origin <- df[last_match, c("brkpt")]
+  
+  for (row in s_idx) {
+    row_end <- df[row, c("brkpt")]
+    # loop through the options from the first possible chunk
+    if (as.integer(start) < as.integer(row_end)) {
+      chunk <- df[row, c("chunk")]
+      if (chunk == c("c1")) {
+        chunk <- c("c0")
+        origin <- c("1")
+      } else {
+        chunk <- df[row-1, c("chunk")]
+        origin <- df[row-1, c("brkpt")]
+      }
+      break
+    }
+  }
+  
+  # calculate offset
+  chunked_start <- as.integer(start) - as.integer(origin)
+  chunked_end <- as.integer(end) - as.integer(origin)
+  
+  output <- paste0(chr_base, c("^"), chunk, c("^o"), origin, c("-"), chunked_start, c("-"), chunked_end)
+  message(output)
+  output
+}
+```
+
+```{r}
+# TESTS FOR CONVERSION
+prlr <- c("NC_090935.1:347426708-348277101")
+prlr <- convert_atac_offsets_ncbi(prlr)
+# correct: NC_090935.1^c0^o1-347426707-348277100
+
+cirbp <- c("NC_090921.1:289121939-289280264")
+cirbp <- convert_atac_offsets_ncbi(cirbp)
+# correct: NC_090921.1^c0^o1-289121938-289280263
+
+#Check for non first non last matching chunk!
+randomROI <- c("NC_090937.1:1012207795-1012207796")
+randomROI <- convert_atac_offsets_ncbi(randomROI)
+# correct: NC_090921.1^c3^o1012207791-4-5
+
+kzd2 <- c("NC_090937.1:1617556835-1617596684")
+kzd2 <- convert_atac_offsets_ncbi(kzd2)
+# correct: NC_090937.1^c4^o1351348895-266207940-266247789
+```
+
+```{r}
+region_around_gene <- function(input, lengthofNewRange = 500000) {
+  # Parse the input
+  # Remove anything after : for the chromosome contig
+  chr_base <- sub("\\:.*", "", input)
+  #message(chr_base)
+  
+  # Extract coordinates - looking for last two numbers separated by -
+  coords <- str_extract_all(input, "\\d+")[[1]]
+  if (length(coords) < 2) {
+    return(NA)
+  }
+  coords <- tail(coords, 2)
+  start <- as.integer(coords[1])
+  end <- as.integer(coords[2])
+  
+  # Compute midway point
+  midway <- floor((start/2 + end/2))
+
+  # Construct new range
+  newstart <- midway - floor(lengthofNewRange/2)
+  newend <- midway + floor(lengthofNewRange/2)
+  newrange <- paste0(chr_base, ":", newstart, "-", newend)
+  
+  return(newrange)
+}
+
+# Test
+#kzd2 <- c("NC_090937.1:1617556835-1617596684")
+#region_around_gene(kzd2)
+```
+
+#### Plot areas of interest
+```{r}
+DefaultAssay(multiome) <- "ATAC"
+
+# **** it! just subset the object lol!
+sub <- subset(multiome, subset = celltype_putative == "Epithelial (Simple/Glandular)")
+#sub <- subset(multiome, subset = dataset == "CTL")
+DefaultAssay(sub) <- "ATAC"
+```
+
+```{r}
+prlr <- c("NC_090935.1:347426708-348277101")
+prlr_around <- region_around_gene(prlr)
+prlr_around <- convert_atac_offsets_ncbi(prlr_around)
+prlr <- convert_atac_offsets_ncbi(prlr)
+
+cirbp <- c("NC_090921.1:289121939-289280264")
+cirbp_around <- region_around_gene(cirbp)
+cirbp_around <- convert_atac_offsets_ncbi(cirbp_around)
+cirbp <- convert_atac_offsets_ncbi(cirbp)
+
+kzd2 <- c("NC_090937.1:1617556835-1617596684")
+kzd2_around <- region_around_gene(kzd2)
+kzd2_around <- convert_atac_offsets_ncbi(kzd2_around)
+kzd2 <- convert_atac_offsets_ncbi(kzd2)
+
+prrx1 <- c("NC_090922.1:705628946-705832812")
+prrx1_around <- region_around_gene(prrx1)
+prrx1_around <- convert_atac_offsets_ncbi(prrx1_around)
+prrx1 <- convert_atac_offsets_ncbi(prrx1)
+
+roi <- prlr
+
+CoveragePlot(
+  object = sub,
+  group.by = 'dataset',
+  #group.by = 'celltype_putative',
+  region = roi
+)
+
+table(sub$sample_id)
+
+```
+#### IN PROGRESS: TROUBLESHOOTING INABILITY TO SUBSET
+```{r}
+cells_of_interest <- intersect(subset_cells, colnames(multiome[["ATAC"]]))
+length(cells_of_interest)
+
+# Check assays & cells
+multiome
+length(colnames(multiome))                # all cells in object
+length(colnames(multiome[["ATAC"]]))      # cells in ATAC assay
+
+all(colnames(multiome[["ATAC"]]) %in% colnames(multiome))
+all(colnames(multiome) %in% colnames(multiome[["ATAC"]]))
+
+atac_counts <- GetAssayData(multiome, assay = "ATAC", slot = "counts")
+dim(atac_counts)
+all(colnames(multiome[["ATAC"]]) == colnames(multiome))
+
+frags <- Fragments(multiome)[[1]]
+
+# cell barcodes stored in the Fragment object
+frag_cells <- frags@cells
+
+length(frag_cells)
+head(frag_cells)
+
+# Now compare with your ATAC assay cells
+atac_cells <- colnames(multiome[["ATAC"]])
+
+all(atac_cells %in% frag_cells)
+all(frag_cells %in% atac_cells)
+# PROBLEM: fragment cells are lacking ID prefix!
+```
+
+```{r}
+# DOESN'T WORK RIGHT NOW: rename cell names to have the sample ID appended
+# only checks order is preserved
+samples <- c("BL1", "BL2", "CTL1", "CTL2", "INT1", "INT2")
+for (n in seq(from=1, to=6, by=1)) {
+  old <- Fragments(multiome)[[n]]@cells   # what is currently in fragments
+  new <- rownames(multiome@meta.data[multiome@meta.data$dataset == samples[n], ])  # what you want them to be
+  for (i in seq(from=1, to=length(old), by=1)) {
+    # check BL1 and BL2
+    if (n == 1 || n ==2) {
+      if (old[i] != substring(new[i], 5, )) {
+        print(old[i])
+        print(substring(new[i], 5, ))
+      }
+    # check INT and CTL
+    } else {
+      if (old[i] != substring(new[i], 6, )) {
+        print(old[i])
+        print(substring(new[i], 6, ))
+      }
+    }
+  }
+}
+
+# OLD ATTEMPT AT PLOTTING SUBSETS OF CELLS - doesn't work because id's are not preserved
+
+#subset_cells <- WhichCells(multiome, expression = SingleR.labels == "Fibroblast I")
+subset_cells <- rownames(multiome@meta.data[multiome@meta.data$SingleR.labels == "Fibroblast II", ])
+
+# TODO: this messes up the datasets????? what if the same barcode is shared among datasets???
+old_subset_cells <- subset_cells
+for (i in seq(from=1, to=length(subset_cells), by=1)) {
+  if (subset_cells[i][1] == "B") {
+    subset_cells[i] <- substring(subset_cells[i], 5, )
+  } else {
+    subset_cells[i] <- substring(subset_cells[i], 6, )
+  }
+}
+```
+
